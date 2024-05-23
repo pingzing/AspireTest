@@ -4,7 +4,7 @@ import otelSdk from './instrumentation';
 
 async function bootstrap() {
   if (otelSdk) {
-    await otelSdk.start();
+    otelSdk.start();
   }
 
   const app = await NestFactory.create(AppModule);
