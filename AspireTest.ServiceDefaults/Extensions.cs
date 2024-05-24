@@ -6,6 +6,9 @@ using Microsoft.Extensions.Logging;
 using OpenTelemetry;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
+using Serilog;
+using Serilog.Exceptions;
+using static Serilog.Sinks.OpenTelemetry.IncludedData;
 
 namespace Microsoft.Extensions.Hosting;
 
@@ -16,8 +19,8 @@ public static class Extensions
 {
     public static IHostApplicationBuilder AddServiceDefaults(this IHostApplicationBuilder builder)
     {
+        builder.ConfigureSerilog();
         builder.ConfigureOpenTelemetry();
-
         builder.AddDefaultHealthChecks();
 
         builder.Services.AddServiceDiscovery();
@@ -34,27 +37,112 @@ public static class Extensions
         return builder;
     }
 
-    public static IHostApplicationBuilder ConfigureOpenTelemetry(this IHostApplicationBuilder builder)
+    public static IHostApplicationBuilder ConfigureSerilog(this IHostApplicationBuilder builder)
     {
-        builder.Logging.AddOpenTelemetry(logging =>
+        ArgumentNullException.ThrowIfNull(builder);
+
+        builder.Services.AddSerilog(config =>
         {
-            logging.IncludeFormattedMessage = true;
-            logging.IncludeScopes = true;
+            config
+                .ReadFrom.Configuration(builder.Configuration)
+                .Enrich.FromLogContext()
+                .Enrich.WithMachineName()
+                .Enrich.WithExceptionDetails()
+                .Enrich.WithProperty("Environment", builder.Environment.EnvironmentName)
+                .WriteTo.OpenTelemetry(options =>
+                {
+                    options.IncludedData = TraceIdField | SpanIdField;
+                    options.Endpoint = builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]!;
+                    AddHeaders(
+                        options.Headers,
+                        builder.Configuration["OTEL_EXPORTER_OTLP_HEADERS"]!
+                    );
+                    AddResourceAttributes(
+                        options.ResourceAttributes,
+                        builder.Configuration["OTEL_RESOURCE_ATTRIBUTES"]!
+                    );
+
+                    static void AddHeaders(IDictionary<string, string> headers, string headerConfig)
+                    {
+                        if (!string.IsNullOrEmpty(headerConfig))
+                        {
+                            foreach (var header in headerConfig.Split(','))
+                            {
+                                var parts = header.Split('=');
+                                if (parts.Length == 2)
+                                {
+                                    headers[parts[0]] = parts[1];
+                                }
+                                else
+                                {
+                                    throw new InvalidOperationException(
+                                        $"Invalid header format: {header}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    static void AddResourceAttributes(
+                        IDictionary<string, object> attributes,
+                        string attributeConfig
+                    )
+                    {
+                        if (!string.IsNullOrEmpty(attributeConfig))
+                        {
+                            var parts = attributeConfig.Split('=');
+
+                            if (parts.Length == 2)
+                            {
+                                attributes[parts[0]] = parts[1];
+                            }
+                            else
+                            {
+                                throw new InvalidOperationException(
+                                    $"Invalid resource attribute foramt: {attributeConfig}"
+                                );
+                            }
+                        }
+                    }
+                });
         });
 
-        builder.Services.AddOpenTelemetry()
+        return builder;
+    }
+
+    public static IHostApplicationBuilder ConfigureOpenTelemetry(
+        this IHostApplicationBuilder builder
+    )
+    {
+        // The default WithLogging is removed, so that projects can add serilog, and make it report to OTLP on their own
+        builder
+            .Services.AddOpenTelemetry()
             .WithMetrics(metrics =>
             {
-                metrics.AddAspNetCoreInstrumentation()
+                metrics
+                    .AddAspNetCoreInstrumentation()
                     .AddHttpClientInstrumentation()
                     .AddRuntimeInstrumentation();
             })
             .WithTracing(tracing =>
             {
-                tracing.AddAspNetCoreInstrumentation()
-                    // Uncomment the following line to enable gRPC instrumentation (requires the OpenTelemetry.Instrumentation.GrpcNetClient package)
-                    //.AddGrpcClientInstrumentation()
-                    .AddHttpClientInstrumentation();
+                if (builder.Environment.IsDevelopment())
+                {
+                    tracing.SetSampler(new AlwaysOnSampler());
+                }
+
+                tracing
+                    .AddAspNetCoreInstrumentation()
+                    .AddHttpClientInstrumentation(options =>
+                        options.FilterHttpRequestMessage = request =>
+                        {
+                            // Don't collect instrumentation on the http requests that send info to the OTLP endpoint
+                            return !request.RequestUri?.AbsoluteUri.Contains(
+                                    builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]!,
+                                    StringComparison.Ordinal
+                                ) ?? true;
+                        }
+                    );
             });
 
         builder.AddOpenTelemetryExporters();
@@ -62,13 +150,22 @@ public static class Extensions
         return builder;
     }
 
-    private static IHostApplicationBuilder AddOpenTelemetryExporters(this IHostApplicationBuilder builder)
+    private static IHostApplicationBuilder AddOpenTelemetryExporters(
+        this IHostApplicationBuilder builder
+    )
     {
-        var useOtlpExporter = !string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]);
+        var useOtlpExporter = !string.IsNullOrWhiteSpace(
+            builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]
+        );
 
         if (useOtlpExporter)
         {
-            builder.Services.AddOpenTelemetry().UseOtlpExporter();
+            builder.Services.ConfigureOpenTelemetryMeterProvider(metrics =>
+                metrics.AddOtlpExporter()
+            );
+            builder.Services.ConfigureOpenTelemetryTracerProvider(tracing =>
+                tracing.AddOtlpExporter()
+            );
         }
 
         // Uncomment the following lines to enable the Azure Monitor exporter (requires the Azure.Monitor.OpenTelemetry.AspNetCore package)
@@ -81,9 +178,12 @@ public static class Extensions
         return builder;
     }
 
-    public static IHostApplicationBuilder AddDefaultHealthChecks(this IHostApplicationBuilder builder)
+    public static IHostApplicationBuilder AddDefaultHealthChecks(
+        this IHostApplicationBuilder builder
+    )
     {
-        builder.Services.AddHealthChecks()
+        builder
+            .Services.AddHealthChecks()
             // Add a default liveness check to ensure app is responsive
             .AddCheck("self", () => HealthCheckResult.Healthy(), ["live"]);
 
@@ -100,10 +200,10 @@ public static class Extensions
             app.MapHealthChecks("/health");
 
             // Only health checks tagged with the "live" tag must pass for app to be considered alive
-            app.MapHealthChecks("/alive", new HealthCheckOptions
-            {
-                Predicate = r => r.Tags.Contains("live")
-            });
+            app.MapHealthChecks(
+                "/alive",
+                new HealthCheckOptions { Predicate = r => r.Tags.Contains("live") }
+            );
         }
 
         return app;
