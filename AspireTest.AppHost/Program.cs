@@ -7,9 +7,9 @@ var redis = builder.AddRedis("redis");
 
 // Add a NodeJS API with the given name, working dir, and 'npm' command
 var nodeApi = builder.AddNpmApp("nodeApi", "../AspireTest.NodeApi", "start:dev")
-    .WithHttpEndpoint(env: "PORT")
+    .WithHttpEndpoint(port: 3000, env: "PORT")
     .WithExternalHttpEndpoints()
-    .PublishAsDockerFile(); // TODO: Gotta actually write this Dockerfile
+    .PublishAsDockerFile(); // TODO: Gotta actually write this Dockerfile    
 
 // Workaround to make sure NodeJS app can communicate with other resources
 if (builder.Environment.IsDevelopment() && builder.Configuration["DOTNET_LAUNCH_PROFILE"] == "https")
